@@ -1,19 +1,24 @@
 import json
-from typing import Optional, List
+from typing import Optional, List, Set
 from sqlalchemy.orm import Session
 
 unassigned_queue: List[int] = []
 
 
-def auto_assign_worker(db: Session, ticket) -> Optional[object]:
+def auto_assign_worker(db: Session, ticket, exclude_worker_ids: Set[int] = None) -> Optional[object]:
     from server.main import Worker, Ticket
+
+    if exclude_worker_ids is None:
+        exclude_worker_ids = set()
 
     workers = db.query(Worker).all()
 
     matching_workers = []
     for worker in workers:
+        if worker.id in exclude_worker_ids:
+            continue
         fault_types = json.loads(worker.fault_types) if worker.fault_types else []
-        if ticket.fault_type in fault_types or ticket.fault_type == "其他":
+        if ticket.fault_type in fault_types:
             matching_workers.append(worker)
 
     if not matching_workers:
@@ -23,12 +28,22 @@ def auto_assign_worker(db: Session, ticket) -> Optional[object]:
     for worker in matching_workers:
         active_count = db.query(Ticket).filter(
             Ticket.assigned_worker_id == worker.id,
-            Ticket.status == "维修中"
+            Ticket.status.in_(["待接单", "维修中"])
         ).count()
         worker_load.append((worker, active_count))
 
     worker_load.sort(key=lambda x: x[1])
     return worker_load[0][0]
+
+
+def try_reassign_after_reject(db: Session, ticket, rejected_worker_id: int) -> Optional[object]:
+    worker = auto_assign_worker(db, ticket, exclude_worker_ids={rejected_worker_id})
+    return worker
+
+
+def remove_from_unassigned_queue(ticket_id: int):
+    while ticket_id in unassigned_queue:
+        unassigned_queue.remove(ticket_id)
 
 
 def notify_worker(worker, ticket):
