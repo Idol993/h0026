@@ -100,6 +100,94 @@ class Notification(Base):
 Base.metadata.create_all(bind=engine)
 
 
+def run_db_migrations():
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        conn = db.connection()
+
+        try:
+            conn.execute(text("ALTER TABLE notifications ADD COLUMN recipient_type VARCHAR(20) DEFAULT '维修工'"))
+            conn.commit()
+            print("[DB迁移] 新增 notifications.recipient_type 字段")
+        except Exception:
+            pass
+
+        try:
+            conn.execute(text("ALTER TABLE notifications ADD COLUMN recipient_name VARCHAR(100)"))
+            conn.commit()
+            print("[DB迁移] 新增 notifications.recipient_name 字段")
+        except Exception:
+            pass
+
+        try:
+            conn.execute(text("ALTER TABLE tickets ADD COLUMN unassigned_reason VARCHAR(200)"))
+            conn.commit()
+            print("[DB迁移] 新增 tickets.unassigned_reason 字段")
+        except Exception:
+            pass
+
+        try:
+            conn.execute(text("ALTER TABLE notifications ADD COLUMN send_result VARCHAR(50) DEFAULT '已发送'"))
+            conn.commit()
+            print("[DB迁移] 新增 notifications.send_result 字段")
+        except Exception:
+            pass
+
+        try:
+            cursor = conn.execute(text("PRAGMA table_info(notifications)"))
+            cols = {row[1]: row for row in cursor.fetchall()}
+            if 'worker_id' in cols and cols['worker_id'][3] == 1:
+                print("[DB迁移] 检测到 notifications.worker_id 为 NOT NULL，正在重建表...")
+                conn.execute(text("""
+                    CREATE TABLE notifications_new (
+                        id INTEGER PRIMARY KEY,
+                        ticket_id INTEGER NOT NULL,
+                        worker_id INTEGER,
+                        recipient_type VARCHAR(20) DEFAULT '维修工',
+                        recipient_name VARCHAR(100),
+                        content TEXT NOT NULL,
+                        notify_type VARCHAR(50) NOT NULL,
+                        send_result VARCHAR(50) DEFAULT '已发送',
+                        created_at DATETIME,
+                        FOREIGN KEY (ticket_id) REFERENCES tickets(id),
+                        FOREIGN KEY (worker_id) REFERENCES workers(id)
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO notifications_new
+                        (id, ticket_id, worker_id, recipient_type, recipient_name, content, notify_type, send_result, created_at)
+                    SELECT id, ticket_id, worker_id,
+                           COALESCE(recipient_type, '维修工'),
+                           COALESCE(recipient_name, (SELECT name FROM workers WHERE workers.id = notifications.worker_id)),
+                           content, notify_type,
+                           COALESCE(send_result, '已发送'),
+                           created_at
+                    FROM notifications
+                """))
+                conn.execute(text("DROP TABLE notifications"))
+                conn.execute(text("ALTER TABLE notifications_new RENAME TO notifications"))
+                conn.commit()
+                print("[DB迁移] notifications 表重建完成，worker_id 已改为可空")
+        except Exception as e:
+            print(f"[DB迁移] 重建表时跳过（可能已处理）: {e}")
+
+        conn.execute(text("UPDATE notifications SET recipient_type = '维修工' WHERE recipient_type IS NULL"))
+        conn.execute(text("UPDATE notifications SET recipient_name = (SELECT name FROM workers WHERE workers.id = notifications.worker_id) WHERE recipient_name IS NULL AND worker_id IS NOT NULL"))
+        conn.execute(text("UPDATE notifications SET send_result = '已发送' WHERE send_result IS NULL"))
+        conn.commit()
+
+        print("[DB迁移] 数据库迁移完成")
+    except Exception as e:
+        print(f"[DB迁移] 迁移过程异常（可忽略）: {e}")
+    finally:
+        db.close()
+
+
+run_db_migrations()
+
+
 class TenantCreate(BaseModel):
     room_number: str
     name: str
@@ -470,6 +558,14 @@ def create_ticket(ticket: TicketCreate, db: Session = Depends(get_db)):
         db_ticket.unassigned_reason = reason
         add_to_unassigned_queue(db_ticket.id, reason)
         add_ticket_log(db, db_ticket.id, "进入待分配", operator="系统", detail=reason)
+        system_notify_content = f"工单{db_ticket.ticket_no}（{db_ticket.fault_type}）无法自动指派，原因：{reason}"
+        create_notification(
+            db, db_ticket.id,
+            recipient_type="系统",
+            recipient_name="系统",
+            content=system_notify_content,
+            notify_type="待分配提醒"
+        )
         front_notify_content = f"工单{db_ticket.ticket_no}（{db_ticket.fault_type}）无法自动指派，原因：{reason}，请手动处理"
         create_notification(
             db, db_ticket.id,
@@ -630,6 +726,14 @@ def reject_ticket(ticket_id: int, reject: TicketReject, db: Session = Depends(ge
         ticket.unassigned_reason = reason
         add_to_unassigned_queue(ticket.id, reason)
         add_ticket_log(db, ticket.id, "进入待分配", operator="系统", detail=reason)
+        system_notify_content = f"工单{ticket.ticket_no}被{rejected_worker_name}拒单后无可用维修工，已进入待分配"
+        create_notification(
+            db, ticket.id,
+            recipient_type="系统",
+            recipient_name="系统",
+            content=system_notify_content,
+            notify_type="待分配提醒"
+        )
         front_notify_content = f"工单{ticket.ticket_no}被{rejected_worker_name}拒单后无可用维修工，已进入待分配，请手动处理"
         create_notification(
             db, ticket.id,
