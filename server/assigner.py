@@ -55,12 +55,22 @@ def remove_from_unassigned_queue(ticket_id: int):
             i += 1
 
 
-def create_notification(db: Session, ticket_id: int, worker_id: int, content: str, notify_type: str) -> int:
+def create_notification(
+    db: Session,
+    ticket_id: int,
+    recipient_type: str,
+    content: str,
+    notify_type: str,
+    worker_id: int = None,
+    recipient_name: str = None,
+) -> int:
     from server.main import Notification
 
     notification = Notification(
         ticket_id=ticket_id,
         worker_id=worker_id,
+        recipient_type=recipient_type,
+        recipient_name=recipient_name,
         content=content,
         notify_type=notify_type,
         send_result="已发送",
@@ -69,7 +79,7 @@ def create_notification(db: Session, ticket_id: int, worker_id: int, content: st
     db.add(notification)
     db.flush()
 
-    print(f"[通知] 维修工ID={worker_id} | 类型={notify_type} | {content}")
+    print(f"[通知] {recipient_type}({recipient_name or worker_id}) | 类型={notify_type} | {content}")
 
     return notification.id
 

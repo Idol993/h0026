@@ -85,7 +85,9 @@ class Notification(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
-    worker_id = Column(Integer, ForeignKey("workers.id"), nullable=False, index=True)
+    worker_id = Column(Integer, ForeignKey("workers.id"), nullable=True, index=True)
+    recipient_type = Column(String(20), nullable=False, default="维修工")
+    recipient_name = Column(String(100), nullable=True)
     content = Column(Text, nullable=False)
     notify_type = Column(String(50), nullable=False)
     send_result = Column(String(50), nullable=False, default="已发送")
@@ -177,9 +179,11 @@ class TicketLogResponse(BaseModel):
 class NotificationResponse(BaseModel):
     id: int
     ticket_id: int
-    worker_id: int
+    worker_id: Optional[int] = None
     worker_name: Optional[str] = None
     ticket_no: Optional[str] = None
+    recipient_type: str
+    recipient_name: Optional[str] = None
     content: str
     notify_type: str
     send_result: str
@@ -272,6 +276,8 @@ def build_ticket_response(ticket: Ticket, db: Session = None) -> dict:
             "worker_id": n.worker_id,
             "worker_name": n.worker.name if n.worker else None,
             "ticket_no": ticket.ticket_no,
+            "recipient_type": n.recipient_type,
+            "recipient_name": n.recipient_name,
             "content": n.content,
             "notify_type": n.notify_type,
             "send_result": n.send_result,
@@ -402,6 +408,8 @@ def list_worker_notifications(
             "worker_id": n.worker_id,
             "worker_name": n.worker.name if n.worker else None,
             "ticket_no": n.ticket.ticket_no if n.ticket else None,
+            "recipient_type": n.recipient_type,
+            "recipient_name": n.recipient_name,
             "content": n.content,
             "notify_type": n.notify_type,
             "send_result": n.send_result,
@@ -436,8 +444,23 @@ def create_ticket(ticket: TicketCreate, db: Session = Depends(get_db)):
         db_ticket.status = "待接单"
         db_ticket.unassigned_reason = None
         add_ticket_log(db, db_ticket.id, "自动指派", operator="系统", detail=f"系统自动指派给维修工 {worker.name}")
-        notify_content = f"您有新的维修工单（{db_ticket.ticket_no}），房号{db_ticket.room_number}，{db_ticket.fault_type}类故障：{db_ticket.description}，请及时接单"
-        create_notification(db, db_ticket.id, worker.id, notify_content, "自动指派通知")
+        worker_notify_content = f"您有新的维修工单（{db_ticket.ticket_no}），房号{db_ticket.room_number}，{db_ticket.fault_type}类故障：{db_ticket.description}，请及时接单"
+        create_notification(
+            db, db_ticket.id,
+            recipient_type="维修工",
+            worker_id=worker.id,
+            recipient_name=worker.name,
+            content=worker_notify_content,
+            notify_type="自动指派通知"
+        )
+        front_notify_content = f"工单{db_ticket.ticket_no}已自动指派给维修工{worker.name}，等待接单"
+        create_notification(
+            db, db_ticket.id,
+            recipient_type="前台",
+            recipient_name="前台",
+            content=front_notify_content,
+            notify_type="自动指派提醒"
+        )
         db.commit()
         db.refresh(db_ticket)
         notify_worker(worker, db_ticket)
@@ -447,6 +470,14 @@ def create_ticket(ticket: TicketCreate, db: Session = Depends(get_db)):
         db_ticket.unassigned_reason = reason
         add_to_unassigned_queue(db_ticket.id, reason)
         add_ticket_log(db, db_ticket.id, "进入待分配", operator="系统", detail=reason)
+        front_notify_content = f"工单{db_ticket.ticket_no}（{db_ticket.fault_type}）无法自动指派，原因：{reason}，请手动处理"
+        create_notification(
+            db, db_ticket.id,
+            recipient_type="前台",
+            recipient_name="前台",
+            content=front_notify_content,
+            notify_type="待分配提醒"
+        )
         db.commit()
         db.refresh(db_ticket)
         print(f"[提醒] 工单 {ticket_no} 无法自动指派，已加入待分配队列，请手动处理")
@@ -477,11 +508,29 @@ def assign_ticket(ticket_id: int, assign: TicketAssign, db: Session = Depends(ge
 
     if prev_worker_name and prev_worker_name != worker.name:
         add_ticket_log(db, ticket.id, "手动改派", operator="前台", detail=f"从 {prev_worker_name} 改派给 {worker.name}")
+        notify_type_label = "手动改派通知"
+        front_notify_content = f"工单{ticket.ticket_no}已从{prev_worker_name}改派给维修工{worker.name}，等待接单"
     else:
         add_ticket_log(db, ticket.id, "手动指派", operator="前台", detail=f"手动指派给维修工 {worker.name}")
+        notify_type_label = "手动指派通知"
+        front_notify_content = f"工单{ticket.ticket_no}已手动指派给维修工{worker.name}，等待接单"
 
-    notify_content = f"您有新的维修工单（{ticket.ticket_no}），房号{ticket.room_number}，{ticket.fault_type}类故障：{ticket.description}，请及时接单"
-    create_notification(db, ticket.id, worker.id, notify_content, "手动指派通知")
+    worker_notify_content = f"您有新的维修工单（{ticket.ticket_no}），房号{ticket.room_number}，{ticket.fault_type}类故障：{ticket.description}，请及时接单"
+    create_notification(
+        db, ticket.id,
+        recipient_type="维修工",
+        worker_id=worker.id,
+        recipient_name=worker.name,
+        content=worker_notify_content,
+        notify_type=notify_type_label
+    )
+    create_notification(
+        db, ticket.id,
+        recipient_type="前台",
+        recipient_name="前台",
+        content=front_notify_content,
+        notify_type="手动指派提醒"
+    )
 
     db.commit()
     db.refresh(ticket)
@@ -553,8 +602,23 @@ def reject_ticket(ticket_id: int, reject: TicketReject, db: Session = Depends(ge
         ticket.status = "待接单"
         ticket.unassigned_reason = None
         add_ticket_log(db, ticket.id, "自动改派", operator="系统", detail=f"系统自动改派给维修工 {new_worker.name}")
-        notify_content = f"您有新的维修工单（{ticket.ticket_no}），房号{ticket.room_number}，{ticket.fault_type}类故障：{ticket.description}，请及时接单"
-        create_notification(db, ticket.id, new_worker.id, notify_content, "拒单改派通知")
+        worker_notify_content = f"您有新的维修工单（{ticket.ticket_no}），房号{ticket.room_number}，{ticket.fault_type}类故障：{ticket.description}，请及时接单"
+        create_notification(
+            db, ticket.id,
+            recipient_type="维修工",
+            worker_id=new_worker.id,
+            recipient_name=new_worker.name,
+            content=worker_notify_content,
+            notify_type="拒单改派通知"
+        )
+        front_notify_content = f"工单{ticket.ticket_no}被{rejected_worker_name}拒单后，已自动改派给维修工{new_worker.name}"
+        create_notification(
+            db, ticket.id,
+            recipient_type="前台",
+            recipient_name="前台",
+            content=front_notify_content,
+            notify_type="拒单改派提醒"
+        )
         db.commit()
         db.refresh(ticket)
         notify_worker(new_worker, ticket)
@@ -566,6 +630,14 @@ def reject_ticket(ticket_id: int, reject: TicketReject, db: Session = Depends(ge
         ticket.unassigned_reason = reason
         add_to_unassigned_queue(ticket.id, reason)
         add_ticket_log(db, ticket.id, "进入待分配", operator="系统", detail=reason)
+        front_notify_content = f"工单{ticket.ticket_no}被{rejected_worker_name}拒单后无可用维修工，已进入待分配，请手动处理"
+        create_notification(
+            db, ticket.id,
+            recipient_type="前台",
+            recipient_name="前台",
+            content=front_notify_content,
+            notify_type="待分配提醒"
+        )
         db.commit()
         db.refresh(ticket)
         print(f"[提醒] 工单 {ticket.ticket_no} 拒单后无可用维修工，已加入待分配队列")
@@ -680,20 +752,50 @@ def export_report(db: Session = Depends(get_db)):
 
 @app.get("/api/unassigned-queue")
 def get_unassigned_queue(db: Session = Depends(get_db)):
+    tickets = db.query(Ticket).filter(
+        Ticket.status == "待指派"
+    ).order_by(Ticket.created_at.desc()).all()
+
     items = []
-    for entry in unassigned_queue:
-        tid = entry["ticket_id"]
-        reason = entry.get("reason")
-        ticket = db.query(Ticket).filter(Ticket.id == tid).first()
+    for ticket in tickets:
         items.append({
-            "ticket_id": tid,
-            "ticket_no": ticket.ticket_no if ticket else None,
-            "room_number": ticket.room_number if ticket else None,
-            "fault_type": ticket.fault_type if ticket else None,
-            "description": ticket.description if ticket else None,
-            "reason": reason,
+            "ticket_id": ticket.id,
+            "ticket_no": ticket.ticket_no,
+            "room_number": ticket.room_number,
+            "fault_type": ticket.fault_type,
+            "description": ticket.description,
+            "reason": ticket.unassigned_reason,
+            "created_at": ticket.created_at,
         })
     return {"unassigned_count": len(items), "items": items}
+
+
+@app.get("/api/notifications", response_model=List[NotificationResponse])
+def list_notifications(
+    recipient_type: Optional[str] = Query(None, description="按通知对象筛选：维修工/前台/系统"),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Notification)
+    if recipient_type:
+        query = query.filter(Notification.recipient_type == recipient_type)
+    notifications = query.order_by(Notification.created_at.desc()).all()
+
+    result = []
+    for n in notifications:
+        result.append({
+            "id": n.id,
+            "ticket_id": n.ticket_id,
+            "worker_id": n.worker_id,
+            "worker_name": n.worker.name if n.worker else None,
+            "ticket_no": n.ticket.ticket_no if n.ticket else None,
+            "recipient_type": n.recipient_type,
+            "recipient_name": n.recipient_name,
+            "content": n.content,
+            "notify_type": n.notify_type,
+            "send_result": n.send_result,
+            "created_at": n.created_at,
+        })
+    return result
 
 
 if __name__ == "__main__":
