@@ -1,8 +1,9 @@
 import json
-from typing import Optional, List, Set
+from datetime import datetime
+from typing import Optional, List, Set, Dict
 from sqlalchemy.orm import Session
 
-unassigned_queue: List[int] = []
+unassigned_queue: List[Dict] = []
 
 
 def auto_assign_worker(db: Session, ticket, exclude_worker_ids: Set[int] = None) -> Optional[object]:
@@ -41,9 +42,36 @@ def try_reassign_after_reject(db: Session, ticket, rejected_worker_id: int) -> O
     return worker
 
 
+def add_to_unassigned_queue(ticket_id: int, reason: str):
+    unassigned_queue.append({"ticket_id": ticket_id, "reason": reason})
+
+
 def remove_from_unassigned_queue(ticket_id: int):
-    while ticket_id in unassigned_queue:
-        unassigned_queue.remove(ticket_id)
+    i = 0
+    while i < len(unassigned_queue):
+        if unassigned_queue[i]["ticket_id"] == ticket_id:
+            unassigned_queue.pop(i)
+        else:
+            i += 1
+
+
+def create_notification(db: Session, ticket_id: int, worker_id: int, content: str, notify_type: str) -> int:
+    from server.main import Notification
+
+    notification = Notification(
+        ticket_id=ticket_id,
+        worker_id=worker_id,
+        content=content,
+        notify_type=notify_type,
+        send_result="已发送",
+        created_at=datetime.utcnow()
+    )
+    db.add(notification)
+    db.flush()
+
+    print(f"[通知] 维修工ID={worker_id} | 类型={notify_type} | {content}")
+
+    return notification.id
 
 
 def notify_worker(worker, ticket):

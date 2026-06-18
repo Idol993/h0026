@@ -4,7 +4,7 @@ import json
 BASE = 'http://localhost:8000'
 
 print('=' * 60)
-print('  物业报修工单API v2.0 完整业务流程测试')
+print('  物业报修工单API v3.0 完整业务流程测试')
 print('=' * 60)
 
 # ===== 1. 创建维修工 =====
@@ -19,137 +19,173 @@ for w in workers_data:
     r = requests.post(f'{BASE}/api/workers', json=w)
     data = r.json()
     worker_ids.append(data['id'])
-    print(f'  创建: {data["name"]} (ID={data["id"]}), 负责类型: {data["fault_types"]}')
+    print(f'  创建: {data["name"]} (ID={data["id"]})')
 
 # ===== 2. 创建业主 =====
 print('\n【步骤2】创建业主')
-tenants_data = [
-    {'room_number': 'A101', 'name': '业主王', 'phone': '13900139001'},
-    {'room_number': 'B202', 'name': '业主李', 'phone': '13900139002'},
-]
-for t in tenants_data:
+for t in [{'room_number': 'A101', 'name': '业主王', 'phone': '13900139001'},
+          {'room_number': 'B202', 'name': '业主李', 'phone': '13900139002'}]:
     r = requests.post(f'{BASE}/api/tenants', json=t)
-    print(f'  创建: {r.json()["name"]} 房号={r.json()["room_number"]}')
+    print(f'  创建: {r.json()["name"]}')
 
-# ===== 3. 提交报修工单（水电类，应自动指派给张师傅，状态=待接单） =====
-print('\n【步骤3】提交报修工单（水电类）')
+# ===== 3. 提交报修工单 → 自动指派 → 检查通知记录 =====
+print('\n【步骤3】提交报修工单(水电) → 自动指派 → 检查通知')
 r = requests.post(f'{BASE}/api/tickets', json={
     'room_number': 'A101', 'description': '厨房水管漏水', 'fault_type': '水电'
 })
 t1 = r.json()
-print(f'  工单号: {t1["ticket_no"]}')
-print(f'  状态: {t1["status"]}')
-print(f'  指派维修工: {t1["assigned_worker_name"]}')
-print(f'  流转日志:')
-for log in t1['logs']:
-    print(f'    [{log["action"]}] {log["detail"]} (操作人: {log["operator"]})')
+t1_id = t1["id"]
+zhang_id = worker_ids[0]  # 张师傅
+print(f'  工单号: {t1["ticket_no"]}, 状态: {t1["status"]}, 指派: {t1["assigned_worker_name"]}')
+print(f'  通知记录:')
+for n in t1['notifications']:
+    print(f'    [{n["notify_type"]}] → {n["worker_name"]}: {n["content"]} (结果: {n["send_result"]})')
 
-# ===== 4. 维修工接单 =====
-print('\n【步骤4】维修工接单')
-r = requests.post(f'{BASE}/api/tickets/{t1["id"]}/accept')
+# ===== 4. 维修工接单（带身份校验） =====
+print('\n【步骤4】维修工接单（带身份校验）')
+# 先用错误的维修工ID尝试接单
+print('  尝试用错误的维修工ID接单...')
+r = requests.post(f'{BASE}/api/tickets/{t1_id}/accept', json={'worker_id': worker_ids[1]})
+if r.status_code == 403:
+    print(f'  ✅ 身份校验生效: {r.json()["detail"]}')
+else:
+    print(f'  ❌ 身份校验未生效: {r.json()}')
+
+# 用正确的维修工ID接单
+print('  用正确的维修工ID接单...')
+r = requests.post(f'{BASE}/api/tickets/{t1_id}/accept', json={'worker_id': zhang_id})
 t1 = r.json()
-print(f'  状态: {t1["status"]}')
-print(f'  流转日志:')
-for log in t1['logs']:
-    print(f'    [{log["action"]}] {log["detail"]}')
+print(f'  接单成功，状态: {t1["status"]}')
 
-# ===== 5. 确认完工+评分 =====
-print('\n【步骤5】确认完工+评分')
-r = requests.post(f'{BASE}/api/tickets/{t1["id"]}/complete', json={'rating': 5})
+# ===== 5. 确认完工（带身份校验） =====
+print('\n【步骤5】确认完工（带身份校验）')
+# 错误的维修工ID
+print('  尝试用错误的维修工ID完工...')
+r = requests.post(f'{BASE}/api/tickets/{t1_id}/complete', json={'worker_id': worker_ids[1], 'rating': 5})
+if r.status_code == 403:
+    print(f'  ✅ 身份校验生效: {r.json()["detail"]}')
+else:
+    print(f'  ❌ 身份校验未生效')
+
+# 正确的维修工ID
+r = requests.post(f'{BASE}/api/tickets/{t1_id}/complete', json={'worker_id': zhang_id, 'rating': 5})
 t1 = r.json()
-print(f'  状态: {t1["status"]}, 耗时: {t1["duration"]}小时, 评分: {t1["rating"]}星')
-print(f'  流转日志:')
-for log in t1['logs']:
-    print(f'    [{log["action"]}] {log["detail"]}')
+print(f'  完工成功，状态: {t1["status"]}, 评分: {t1["rating"]}星')
 
-# ===== 6. 提交报修工单（照明类，张师傅1单已完成，应指派给张师傅）→ 拒单测试 =====
-print('\n【步骤6】提交报修工单（照明类）→ 测试拒单流程')
+# ===== 6. 提交报修(照明) → 拒单测试（带身份校验+空格原因校验） =====
+print('\n【步骤6】提交报修(照明) → 拒单测试')
 r = requests.post(f'{BASE}/api/tickets', json={
     'room_number': 'B202', 'description': '客厅灯不亮了', 'fault_type': '照明'
 })
 t2 = r.json()
+t2_id = t2["id"]
 print(f'  工单号: {t2["ticket_no"]}, 状态: {t2["status"]}, 指派: {t2["assigned_worker_name"]}')
 
-# 张师傅拒单
-print('\n  张师傅拒单...')
-r = requests.post(f'{BASE}/api/tickets/{t2["id"]}/reject', json={'reason': '正在赶往其他小区处理紧急事故'})
+# 测试纯空格拒单原因
+print('  尝试用纯空格拒单原因...')
+r = requests.post(f'{BASE}/api/tickets/{t2_id}/reject', json={
+    'worker_id': zhang_id, 'reason': '   '
+})
+if r.status_code == 422:
+    print(f'  ✅ 空格原因校验生效: 422错误')
+else:
+    print(f'  ❌ 空格原因未拦截: {r.status_code}')
+
+# 错误的维修工ID拒单
+print('  尝试用错误的维修工ID拒单...')
+r = requests.post(f'{BASE}/api/tickets/{t2_id}/reject', json={
+    'worker_id': worker_ids[1], 'reason': '不在负责范围'
+})
+if r.status_code == 403:
+    print(f'  ✅ 身份校验生效: {r.json()["detail"]}')
+else:
+    print(f'  ❌ 身份校验未生效')
+
+# 正确拒单
+print('  张师傅正确拒单...')
+r = requests.post(f'{BASE}/api/tickets/{t2_id}/reject', json={
+    'worker_id': zhang_id, 'reason': '正在赶往其他小区处理紧急事故'
+})
 t2 = r.json()
-print(f'  拒单后状态: {t2["status"]}, 新指派: {t2["assigned_worker_name"]}')
+print(f'  拒单后状态: {t2["status"]}, 指派: {t2["assigned_worker_name"]}')
 print(f'  流转日志:')
 for log in t2['logs']:
     print(f'    [{log["action"]}] {log["detail"]}')
 
-# 新维修工接单
-if t2["assigned_worker_name"]:
-    print(f'\n  {t2["assigned_worker_name"]}接单...')
-    r = requests.post(f'{BASE}/api/tickets/{t2["id"]}/accept')
-    t2 = r.json()
-    print(f'  接单后状态: {t2["status"]}')
-
-# ===== 7. 提交报修工单（其他类）→ 测试"其他"类型只分给负责其他的维修工 =====
-print('\n【步骤7】提交报修工单（其他类）→ 测试"其他"类型修复')
+# ===== 7. 提交报修(门禁) → 李师傅拒单 → 无人可派 → 待分配含原因 =====
+print('\n【步骤7】提交报修(门禁) → 拒单后无人可派')
 r = requests.post(f'{BASE}/api/tickets', json={
-    'room_number': 'A101', 'description': '楼道墙面脱落', 'fault_type': '其他'
+    'room_number': 'A101', 'description': '门禁卡刷不开门', 'fault_type': '门禁'
 })
 t3 = r.json()
-print(f'  工单号: {t3["ticket_no"]}, 状态: {t3["status"]}, 指派: {t3["assigned_worker_name"]}')
-if t3["assigned_worker_name"] == "王师傅":
-    print('  ✅ "其他"类型正确只指派给负责"其他"的维修工（王师傅）')
-else:
-    print(f'  ❌ "其他"类型指派有误，应指派给王师傅，实际指派给{t3["assigned_worker_name"]}')
+t3_id = t3["id"]
+li_id = worker_ids[1]
+print(f'  工单号: {t3["ticket_no"]}, 指派: {t3["assigned_worker_name"]}')
 
-# ===== 8. 测试无法自动指派 → 进入待分配队列 =====
-print('\n【步骤8】提交报修工单（门禁类）→ 李师傅拒单后无人可派')
-r = requests.post(f'{BASE}/api/tickets', json={
-    'room_number': 'B202', 'description': '门禁卡刷不开门', 'fault_type': '门禁'
+r = requests.post(f'{BASE}/api/tickets/{t3_id}/reject', json={
+    'worker_id': li_id, 'reason': '今天请假了'
 })
-t4 = r.json()
-print(f'  工单号: {t4["ticket_no"]}, 状态: {t4["status"]}, 指派: {t4["assigned_worker_name"]}')
+t3 = r.json()
+print(f'  拒单后状态: {t3["status"]}, 待分配原因: {t3["unassigned_reason"]}')
 
-# 李师傅拒单（门禁只有李师傅负责，拒单后无人可派）
-if t4["assigned_worker_name"] == "李师傅":
-    print('  李师傅拒单...')
-    r = requests.post(f'{BASE}/api/tickets/{t4["id"]}/reject', json={'reason': '今天请假了'})
-    t4 = r.json()
-    print(f'  拒单后状态: {t4["status"]}, 指派: {t4["assigned_worker_name"]}')
-
-# 检查待分配队列
+# ===== 8. 待分配列表（含原因） =====
+print('\n【步骤8】待分配列表（含原因）')
 r = requests.get(f'{BASE}/api/unassigned-queue')
 queue = r.json()
-print(f'  待分配队列: {queue}')
+for item in queue['items']:
+    print(f'  工单{item["ticket_no"]} | 房号{item["room_number"]} | {item["fault_type"]} | 原因: {item["reason"]}')
 
-# ===== 9. 手动指派 → 测试从待分配队列移除 =====
-print('\n【步骤9】手动指派待分配工单 → 测试从队列移除')
-r = requests.post(f'{BASE}/api/tickets/{t4["id"]}/assign', json={'worker_id': worker_ids[0]})
-t4 = r.json()
-print(f'  手动指派后状态: {t4["status"]}, 指派: {t4["assigned_worker_name"]}')
+# ===== 9. 手动指派 → 状态同步 + 待分配列表清理 =====
+print('\n【步骤9】手动指派 → 验证状态同步')
+r = requests.post(f'{BASE}/api/tickets/{t3_id}/assign', json={'worker_id': zhang_id})
+t3 = r.json()
+print(f'  手动指派后: 状态={t3["status"]}, unassigned_reason={t3["unassigned_reason"]}')
 
+# 验证待分配列表
 r = requests.get(f'{BASE}/api/unassigned-queue')
 queue = r.json()
-print(f'  待分配队列: {queue}')
-if t4["id"] not in queue["ticket_ids"]:
-    print('  ✅ 手动指派成功后，工单已从待分配队列移除')
+found = any(item['ticket_id'] == t3_id for item in queue['items'])
+if not found:
+    print('  ✅ 工单已从待分配列表移除')
 else:
-    print('  ❌ 手动指派后，工单仍在待分配队列中')
+    print('  ❌ 工单仍在待分配列表')
 
-# ===== 10. 查看工单详情（含完整流转日志） =====
-print('\n【步骤10】查看工单详情（含完整流转日志）')
-r = requests.get(f'{BASE}/api/tickets/{t1["id"]}')
+# 验证通知记录
+print(f'  通知记录:')
+for n in t3['notifications']:
+    print(f'    [{n["notify_type"]}] → {n["worker_name"]}: {n["content"]}')
+
+# ===== 10. 维修工工作台 =====
+print('\n【步骤10】维修工工作台')
+for status in ['待接单', '维修中', '已完成']:
+    r = requests.get(f'{BASE}/api/workers/{zhang_id}/tickets?status={status}')
+    tickets = r.json()
+    print(f'  张师傅 - {status}: {len(tickets)} 条')
+    for t in tickets:
+        print(f'    {t["ticket_no"]} | {t["room_number"]} | {t["description"]}')
+
+# ===== 11. 维修工通知列表 =====
+print('\n【步骤11】维修工通知列表')
+r = requests.get(f'{BASE}/api/workers/{zhang_id}/notifications')
+notifications = r.json()
+print(f'  张师傅收到 {len(notifications)} 条通知:')
+for n in notifications:
+    print(f'    [{n["notify_type"]}] 工单{n["ticket_no"]}: {n["content"]}')
+
+# ===== 12. 工单详情（含流转日志+通知记录） =====
+print('\n【步骤12】工单详情（含完整流转日志+通知记录）')
+r = requests.get(f'{BASE}/api/tickets/{t1_id}')
 detail = r.json()
-print(f'  工单: {detail["ticket_no"]} 状态: {detail["status"]}')
-print(f'  完整流转记录:')
+print(f'  工单: {detail["ticket_no"]}')
+print(f'  流转日志:')
 for log in detail['logs']:
     print(f'    {log["created_at"][:19]} | {log["action"]} | {log["operator"]} | {log["detail"]}')
+print(f'  通知记录:')
+for n in detail['notifications']:
+    print(f'    {n["created_at"][:19]} | {n["notify_type"]} | → {n["worker_name"]} | {n["content"]}')
 
-# ===== 11. 按状态筛选 =====
-print('\n【步骤11】按状态筛选')
-for s in ['待接单', '维修中', '已完成', '待指派']:
-    r = requests.get(f'{BASE}/api/tickets?status={s}')
-    count = len(r.json())
-    print(f'  {s}: {count} 条')
-
-# ===== 12. 统计报表 =====
-print('\n【步骤12】统计报表')
+# ===== 13. 统计报表 =====
+print('\n【步骤13】统计报表')
 r = requests.get(f'{BASE}/api/reports/monthly')
 print(json.dumps(r.json(), ensure_ascii=False, indent=2))
 
